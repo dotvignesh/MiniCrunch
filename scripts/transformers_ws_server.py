@@ -11,6 +11,7 @@ import uuid
 import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -65,20 +66,20 @@ class Runtime:
             use_fast=True,
         )
 
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": self.dtype,
-            "trust_remote_code": args.trust_remote_code,
-        }
-        if self.device_type == "cuda":
-            model_kwargs["device_map"] = "auto"
-
-        model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
+        model, loader_name = _load_text_generation_model(
+            model_id=args.model_id,
+            dtype=self.dtype,
+            device_type=self.device_type,
+            trust_remote_code=args.trust_remote_code,
+        )
         if self.device_type != "cuda":
             model.to(self.device_type)
         model.eval()
 
         self.tokenizer = tokenizer
         self.model = model
+        self.model_loader_name = loader_name
+        self._text_model = _select_text_forward_model(model)
         self.input_device = next(model.parameters()).device
 
         vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
@@ -143,13 +144,15 @@ class Runtime:
                     device=self.input_device,
                     dtype=torch.long,
                 )
-                outputs = self.model(input_ids=input_ids, use_cache=True)
+                outputs = self._run_text_forward(
+                    input_ids=input_ids,
+                    past_key_values=None,
+                )
             else:
                 input_ids = torch.tensor([[int(token_id)]], device=self.input_device, dtype=torch.long)
-                outputs = self.model(
+                outputs = self._run_text_forward(
                     input_ids=input_ids,
                     past_key_values=state.past_key_values,
-                    use_cache=True,
                 )
 
         state.past_key_values = outputs.past_key_values
@@ -163,6 +166,135 @@ class Runtime:
         for idx, logprob in zip(top_indices.tolist(), top_logprobs.tolist()):
             entries.append({"token_id": int(idx), "logprob": float(logprob)})
         return entries
+
+    def _run_text_forward(self, input_ids: torch.Tensor, past_key_values: Any | None) -> Any:
+        attempts = [self._text_model]
+        if self._text_model is not self.model:
+            attempts.append(self.model)
+
+        last_error: Exception | None = None
+        for candidate in attempts:
+            try:
+                if past_key_values is None:
+                    return candidate(input_ids=input_ids, use_cache=True)
+                return candidate(
+                    input_ids=input_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+            except TypeError as exc:
+                # Some wrappers may not expose past_key_values in text-only mode.
+                if past_key_values is not None:
+                    try:
+                        return candidate(input_ids=input_ids, use_cache=True)
+                    except Exception as inner_exc:
+                        last_error = inner_exc
+                        continue
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
+
+        raise RuntimeError(
+            "Model forward failed for text-only next-token scoring. "
+            f"Loader={self.model_loader_name}, last_error={last_error}"
+        )
+
+
+def _build_model_kwargs(
+    *,
+    dtype: torch.dtype,
+    device_type: str,
+    trust_remote_code: bool,
+    use_legacy_torch_dtype: bool,
+) -> dict[str, Any]:
+    model_kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+    if use_legacy_torch_dtype:
+        model_kwargs["torch_dtype"] = dtype
+    else:
+        model_kwargs["dtype"] = dtype
+    if device_type == "cuda":
+        model_kwargs["device_map"] = "auto"
+    return model_kwargs
+
+
+def _load_with_loader(
+    *,
+    loader: Any,
+    model_id: str,
+    dtype: torch.dtype,
+    device_type: str,
+    trust_remote_code: bool,
+) -> Any:
+    try:
+        kwargs = _build_model_kwargs(
+            dtype=dtype,
+            device_type=device_type,
+            trust_remote_code=trust_remote_code,
+            use_legacy_torch_dtype=False,
+        )
+        return loader.from_pretrained(model_id, **kwargs)
+    except TypeError:
+        kwargs = _build_model_kwargs(
+            dtype=dtype,
+            device_type=device_type,
+            trust_remote_code=trust_remote_code,
+            use_legacy_torch_dtype=True,
+        )
+        return loader.from_pretrained(model_id, **kwargs)
+
+
+def _load_text_generation_model(
+    *,
+    model_id: str,
+    dtype: torch.dtype,
+    device_type: str,
+    trust_remote_code: bool,
+) -> tuple[Any, str]:
+    attempted_errors: list[str] = []
+
+    def _attempt(loader: Any, loader_name: str) -> tuple[Any, str] | None:
+        try:
+            model = _load_with_loader(
+                loader=loader,
+                model_id=model_id,
+                dtype=dtype,
+                device_type=device_type,
+                trust_remote_code=trust_remote_code,
+            )
+            return model, loader_name
+        except Exception as exc:
+            attempted_errors.append(f"{loader_name}: {type(exc).__name__}: {exc}")
+            return None
+
+    result = _attempt(AutoModelForCausalLM, "AutoModelForCausalLM")
+    if result is not None:
+        return result
+
+    image_text_loader = getattr(transformers, "AutoModelForImageTextToText", None)
+    if image_text_loader is not None:
+        result = _attempt(image_text_loader, "AutoModelForImageTextToText")
+        if result is not None:
+            return result
+
+    vision2seq_loader = getattr(transformers, "AutoModelForVision2Seq", None)
+    if vision2seq_loader is not None:
+        result = _attempt(vision2seq_loader, "AutoModelForVision2Seq")
+        if result is not None:
+            return result
+
+    details = " | ".join(attempted_errors[-3:])
+    raise RuntimeError(
+        "Unable to load model for text next-token scoring with available Transformers loaders. "
+        f"model_id={model_id!r}. Recent errors: {details}"
+    )
+
+
+def _select_text_forward_model(model: Any) -> Any:
+    if hasattr(model, "language_model"):
+        language_model = getattr(model, "language_model")
+        if callable(getattr(language_model, "forward", None)):
+            return language_model
+    return model
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -179,6 +311,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             "status": "ok",
             "model_id": runtime.model_id,
             "dtype": runtime.dtype_name,
+            "loader": runtime.model_loader_name,
             "vocab_size": runtime.vocab_size,
             "ws_path": "/ws",
         }
@@ -232,6 +365,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             session_id=state.session_id,
                             model_id=runtime.model_id,
                             dtype=runtime.dtype_name,
+                            loader=runtime.model_loader_name,
                             vocab_size=runtime.vocab_size,
                             bos_token_id=runtime.bos_token_id,
                             eos_token_id=runtime.eos_token_id,
