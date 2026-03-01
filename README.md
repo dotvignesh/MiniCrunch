@@ -36,6 +36,7 @@ export NGROK_AUTHTOKEN="<your-ngrok-token>"
 python scripts/vllm_http_server.py \
   --model-id mistralai/Ministral-3-3B-Instruct-2512 \
   --max-model-len 8192 \
+  --max-logprobs 256 \
   --host 0.0.0.0 \
   --port 8000 \
   --tunnel ngrok \
@@ -49,6 +50,8 @@ PUBLIC_URL=https://abc123.ngrok-free.app
 ```
 
 Use that URL as `--vllm-url` from your laptop.
+
+If you want larger top-K distributions, raise `--max-logprobs` on the server and set matching `--vllm-top-k` on the client.
 
 ## CLI
 

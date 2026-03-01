@@ -79,6 +79,20 @@ class VllmHttpPrior:
         if self.max_context_tokens <= 0:
             self.max_context_tokens = max(1, config.vllm_max_context)
 
+        remote_max_logprobs = meta.get("max_logprobs")
+        try:
+            remote_max_logprobs_int = int(remote_max_logprobs)
+        except (TypeError, ValueError):
+            remote_max_logprobs_int = -1
+        if remote_max_logprobs_int > 0 and self._top_k > remote_max_logprobs_int:
+            self._top_k = remote_max_logprobs_int
+            warnings.warn(
+                f"Remote vLLM /meta max_logprobs={remote_max_logprobs_int}; "
+                "clamping --vllm-top-k to that value.",
+                stacklevel=2,
+            )
+            self._warned_top_k_clamp = True
+
         bos_token_id = int(meta.get("bos_token_id", -1))
         if bos_token_id < 0:
             bos_token_id = int(meta.get("eos_token_id", -1))

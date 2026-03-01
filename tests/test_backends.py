@@ -159,6 +159,35 @@ def test_vllm_prior_requires_positive_top_k() -> None:
         )
 
 
+def test_vllm_prior_clamps_top_k_from_meta(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict | None, float]] = []
+    fake_requests = _make_fake_requests(
+        meta={
+            "model_id": "mistralai/Ministral-3-3B-Instruct-2512",
+            "vocab_size": 6,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "max_model_len": 16,
+            "max_logprobs": 20,
+        },
+        calls=calls,
+    )
+    monkeypatch.setattr(backends.VllmHttpPrior, "_import_requests", lambda _self: fake_requests)
+
+    with pytest.warns(UserWarning, match="clamping --vllm-top-k"):
+        prior = backends.VllmHttpPrior(
+            backends.LoadConfig(
+                model_id="mistralai/Ministral-3-3B-Instruct-2512",
+                vllm_url="https://example.ngrok-free.app",
+                vllm_top_k=256,
+            )
+        )
+
+    prior.next_logits()
+    next_calls = [payload for method, url, payload, _ in calls if method == "POST" and url.endswith("/next-token-logprobs")]
+    assert next_calls[0] == {"token_ids": [1], "top_k": 20}
+
+
 def test_vllm_prior_requires_bos_or_eos(monkeypatch) -> None:
     fake_requests = _make_fake_requests(
         meta={

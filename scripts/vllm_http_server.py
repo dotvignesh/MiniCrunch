@@ -149,14 +149,24 @@ def _generate_with_token_ids(
 
 
 def build_app(args: argparse.Namespace) -> FastAPI:
-    llm = LLM(
+    llm_kwargs = dict(
         model=args.model_id,
         dtype=args.dtype,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tensor_parallel_size,
         trust_remote_code=args.trust_remote_code,
+        max_logprobs=args.max_logprobs,
     )
+    supports_max_logprobs_kw = True
+    try:
+        llm = LLM(**llm_kwargs)
+    except TypeError as exc:
+        if "max_logprobs" not in str(exc):
+            raise
+        llm_kwargs.pop("max_logprobs", None)
+        supports_max_logprobs_kw = False
+        llm = LLM(**llm_kwargs)
     tokenizer = llm.get_tokenizer()
     vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
@@ -164,12 +174,16 @@ def build_app(args: argparse.Namespace) -> FastAPI:
     engine = getattr(llm, "llm_engine", None)
     model_config = getattr(engine, "model_config", None)
     max_model_len = int(getattr(model_config, "max_model_len", args.max_model_len))
+    max_logprobs_raw = getattr(model_config, "max_logprobs", None)
+    if max_logprobs_raw is None and supports_max_logprobs_kw:
+        max_logprobs_raw = args.max_logprobs
+    max_logprobs = int(max_logprobs_raw) if max_logprobs_raw is not None else None
 
     app = FastAPI(title="MiniCrunch vLLM logits server", version="1.0")
 
     @app.get("/meta")
     def meta() -> dict[str, Any]:
-        return {
+        payload = {
             "model_id": args.model_id,
             "dtype": args.dtype,
             "vocab_size": vocab_size,
@@ -177,6 +191,9 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             "eos_token_id": eos_token_id,
             "max_model_len": max_model_len,
         }
+        if max_logprobs is not None:
+            payload["max_logprobs"] = max_logprobs
+        return payload
 
     @app.post("/tokenize")
     def tokenize(req: TokenizeRequest) -> dict[str, Any]:
@@ -274,6 +291,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument(
+        "--max-logprobs",
+        type=int,
+        default=256,
+        help="Max logprobs accepted by the server for /next-token-logprobs.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
