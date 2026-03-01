@@ -13,7 +13,6 @@ from minicrunch.wiki import fetch_wikipedia_extract
 
 
 DEFAULT_MODEL_ID = "mistralai/Ministral-3-3B-Instruct-2512"
-BACKEND_CHOICES = ["transformers", "llamacpp", "vllm"]
 
 
 def _ratio_percent(size: int, original: int) -> float:
@@ -40,32 +39,21 @@ def _read_text(args: argparse.Namespace) -> str:
     raise ValueError("Provide --input or --wikipedia-title")
 
 
-def _load_prior_from_args(args: argparse.Namespace, model_id: str, backend: str, dtype: str):
+def _load_prior_from_args(args: argparse.Namespace, model_id: str):
     return load_prior(
         model_id=model_id,
-        backend=backend,
-        device=args.device,
-        dtype=dtype,
-        llama_n_ctx=args.llama_n_ctx,
-        llama_n_batch=args.llama_n_batch,
-        llama_n_threads=args.llama_n_threads,
-        llama_n_gpu_layers=args.llama_n_gpu_layers,
         vllm_url=args.vllm_url,
         vllm_top_k=args.vllm_top_k,
         vllm_timeout_seconds=args.vllm_timeout_seconds,
         vllm_fallback_logit=args.vllm_fallback_logit,
+        vllm_max_context=args.vllm_max_context,
     )
 
 
 def cmd_compress(args: argparse.Namespace) -> int:
     text = Path(args.input).read_text(encoding="utf-8")
 
-    prior = _load_prior_from_args(
-        args=args,
-        model_id=args.model_id,
-        backend=args.backend,
-        dtype=args.dtype,
-    )
+    prior = _load_prior_from_args(args=args, model_id=args.model_id)
     result = compress_text(
         text=text,
         prior=prior,
@@ -102,15 +90,8 @@ def cmd_decompress(args: argparse.Namespace) -> int:
     header, _ = unpack_archive(archive)
 
     model_id = args.model_id or header["model_id"]
-    backend = args.backend or header.get("backend", "transformers")
-    dtype = args.dtype or header.get("dtype", "auto")
 
-    prior = _load_prior_from_args(
-        args=args,
-        model_id=model_id,
-        backend=backend,
-        dtype=dtype,
-    )
+    prior = _load_prior_from_args(args=args, model_id=model_id)
     result = decompress_archive(
         archive=archive,
         prior=prior,
@@ -137,12 +118,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     gzip_bytes = gzip.compress(source_bytes, compresslevel=9)
     zstd_bytes = zstd.ZstdCompressor(level=19).compress(source_bytes)
 
-    prior = _load_prior_from_args(
-        args=args,
-        model_id=args.model_id,
-        backend=args.backend,
-        dtype=args.dtype,
-    )
+    prior = _load_prior_from_args(args=args, model_id=args.model_id)
 
     compress_result = compress_text(
         text=text,
@@ -203,57 +179,27 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="minicrunch",
-        description="LLM arithmetic-coding demo with mistralai/Ministral-3-3B-Instruct-2512",
+        description="vLLM-based arithmetic-coding demo with mistralai/Ministral-3-3B-Instruct-2512",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_model_args(subparser: argparse.ArgumentParser, with_default: bool = True) -> None:
         if with_default:
             subparser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-            subparser.add_argument("--backend", default="transformers", choices=BACKEND_CHOICES)
-            subparser.add_argument("--dtype", default="auto", choices=["auto", "float16", "bfloat16", "float32"])
         else:
             subparser.add_argument("--model-id")
-            subparser.add_argument("--backend", choices=BACKEND_CHOICES)
-            subparser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"])
-        subparser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-
-    def add_llama_args(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument(
-            "--llama-n-ctx",
-            type=int,
-            default=8192,
-            help="Context window for llama.cpp backend",
-        )
-        subparser.add_argument(
-            "--llama-n-batch",
-            type=int,
-            default=512,
-            help="Batch size for llama.cpp decode calls",
-        )
-        subparser.add_argument(
-            "--llama-n-threads",
-            type=int,
-            default=0,
-            help="CPU threads for llama.cpp (0 = auto)",
-        )
-        subparser.add_argument(
-            "--llama-n-gpu-layers",
-            type=int,
-            default=None,
-            help="GPU layers for llama.cpp (default: auto by device)",
-        )
 
     def add_vllm_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument(
             "--vllm-url",
-            help="Base URL for remote vLLM logits server (for backend=vllm)",
+            required=True,
+            help="Base URL for remote vLLM logits server",
         )
         subparser.add_argument(
             "--vllm-top-k",
             type=int,
             default=256,
-            help="Top-K logprobs requested from vLLM server for backend=vllm",
+            help="Top-K logprobs requested from vLLM server",
         )
         subparser.add_argument(
             "--vllm-timeout-seconds",
@@ -267,6 +213,12 @@ def build_parser() -> argparse.ArgumentParser:
             default=-50.0,
             help="Logit assigned to tokens outside vLLM top-k set",
         )
+        subparser.add_argument(
+            "--vllm-max-context",
+            type=int,
+            default=8192,
+            help="Fallback max context when server /meta does not return max_model_len",
+        )
 
     compress_parser = subparsers.add_parser("compress", help="Compress a UTF-8 text file")
     compress_parser.add_argument("--input", required=True, help="Input UTF-8 text file")
@@ -274,7 +226,6 @@ def build_parser() -> argparse.ArgumentParser:
     compress_parser.add_argument("--total-freq", type=int, default=1 << 20)
     compress_parser.add_argument("--progress-every", type=int, default=100)
     add_model_args(compress_parser, with_default=True)
-    add_llama_args(compress_parser)
     add_vllm_args(compress_parser)
     compress_parser.set_defaults(func=cmd_compress)
 
@@ -284,7 +235,6 @@ def build_parser() -> argparse.ArgumentParser:
     decompress_parser.add_argument("--progress-every", type=int, default=100)
     decompress_parser.add_argument("--no-verify", action="store_true")
     add_model_args(decompress_parser, with_default=False)
-    add_llama_args(decompress_parser)
     add_vllm_args(decompress_parser)
     decompress_parser.set_defaults(func=cmd_decompress)
 
@@ -297,7 +247,6 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--output-archive", help="Optional archive output path")
     benchmark_parser.add_argument("--output-decoded", help="Optional decoded text output path")
     add_model_args(benchmark_parser, with_default=True)
-    add_llama_args(benchmark_parser)
     add_vllm_args(benchmark_parser)
     benchmark_parser.set_defaults(func=cmd_benchmark)
 

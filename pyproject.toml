@@ -8,12 +8,16 @@ dependencies = [
   "numpy>=1.26",
   "requests>=2.32",
   "torch>=2.4",
-  "transformers>=4.48",
   "zstandard>=0.23",
 ]
 
 [project.optional-dependencies]
-llamacpp = ["llama-cpp-python>=0.3.5"]
+server = [
+  "fastapi>=0.115",
+  "pyngrok>=7.2",
+  "uvicorn>=0.30",
+  "vllm>=0.7",
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.8",

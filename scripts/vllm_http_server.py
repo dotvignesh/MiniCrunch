@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Host vLLM logits endpoint for MiniCrunch.")
     parser.add_argument(
         "--model-id",
-        default="mistralai/Ministral-3B-Instruct-2410",
+        default="mistralai/Ministral-3-3B-Instruct-2512",
         help="Model to load in vLLM.",
     )
     parser.add_argument("--dtype", default="auto", help="vLLM dtype (for example: auto, float16).")
