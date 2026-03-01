@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 from typing import Any
@@ -53,6 +54,80 @@ def _extract_top_logprobs(raw: Any) -> list[dict[str, float]]:
 
     items.sort(key=lambda pair: pair[1], reverse=True)
     return [{"token_id": token_id, "logprob": logprob} for token_id, logprob in items]
+
+
+def _is_signature_mismatch_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        token in message
+        for token in (
+            "unexpected keyword",
+            "missing",
+            "positional argument",
+            "keyword-only",
+            "takes",
+            "argument",
+            "prompt",
+            "input",
+            "token",
+        )
+    )
+
+
+def _generate_with_token_ids(
+    llm: LLM, token_ids: list[int], sampling_params: SamplingParams
+) -> list[Any]:
+    generate_fn = llm.generate
+    signature = inspect.signature(generate_fn)
+    parameter_names = set(signature.parameters)
+
+    base_kwargs: dict[str, Any] = {"sampling_params": sampling_params}
+    if "use_tqdm" in parameter_names:
+        base_kwargs["use_tqdm"] = False
+
+    attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def add_attempt(*args: Any, **kwargs: Any) -> None:
+        payload = base_kwargs.copy()
+        payload.update(kwargs)
+        attempts.append((args, payload))
+
+    tokens_prompt = {"prompt_token_ids": token_ids}
+
+    # vLLM<=0.7 style APIs (prompt_token_ids kwarg).
+    if "prompt_token_ids" in parameter_names:
+        add_attempt(prompt_token_ids=[token_ids])
+        if "prompts" in parameter_names:
+            add_attempt(prompts=[""], prompt_token_ids=[token_ids])
+
+    # vLLM>=0.8 style APIs (prompts/inputs expect PromptType entries).
+    if "prompts" in parameter_names:
+        add_attempt(prompts=[tokens_prompt])
+        add_attempt(prompts=[token_ids])
+    if "inputs" in parameter_names:
+        add_attempt(inputs=[tokens_prompt])
+        add_attempt(inputs=[token_ids])
+
+    # Positional fallbacks for versions with unstable naming.
+    add_attempt([tokens_prompt])
+    add_attempt([token_ids])
+
+    last_error: Exception | None = None
+    for args, kwargs in attempts:
+        try:
+            return generate_fn(*args, **kwargs)
+        except TypeError as exc:
+            if not _is_signature_mismatch_error(exc):
+                raise
+            last_error = exc
+        except ValueError as exc:
+            if not _is_signature_mismatch_error(exc):
+                raise
+            last_error = exc
+
+    raise RuntimeError(
+        "Unable to call vLLM generate() with token IDs for this installed version."
+    ) from last_error
 
 
 def build_app(args: argparse.Namespace) -> FastAPI:
@@ -117,18 +192,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             detokenize=False,
         )
         try:
-            outputs = llm.generate(
-                prompt_token_ids=[req.token_ids],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
-        except TypeError:
-            outputs = llm.generate(
-                prompts=[""],
-                prompt_token_ids=[req.token_ids],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
+            outputs = _generate_with_token_ids(llm, req.token_ids, sampling_params)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to query vLLM generate() for token logprobs: {exc}",
+            ) from exc
         if not outputs:
             raise HTTPException(status_code=500, detail="vLLM returned no outputs.")
         result = outputs[0]
