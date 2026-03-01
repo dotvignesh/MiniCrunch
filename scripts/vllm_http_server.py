@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Any
 
 import uvicorn
@@ -150,6 +151,31 @@ def build_app(args: argparse.Namespace) -> FastAPI:
     return app
 
 
+def maybe_start_tunnel(args: argparse.Namespace) -> tuple[str | None, Any | None]:
+    if args.tunnel == "none":
+        return None, None
+    if args.tunnel != "ngrok":
+        raise RuntimeError(f"Unsupported tunnel provider: {args.tunnel}")
+
+    try:
+        from pyngrok import ngrok
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tunnel provider 'ngrok' requires pyngrok. Install it with: pip install pyngrok"
+        ) from exc
+
+    authtoken = args.ngrok_authtoken or os.getenv("NGROK_AUTHTOKEN")
+    if authtoken:
+        ngrok.set_auth_token(authtoken)
+
+    connect_kwargs = {"addr": str(args.port), "proto": "http"}
+    if args.ngrok_domain:
+        connect_kwargs["domain"] = args.ngrok_domain
+
+    tunnel = ngrok.connect(**connect_kwargs)
+    return str(tunnel.public_url), ngrok
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Host vLLM logits endpoint for MiniCrunch.")
     parser.add_argument(
@@ -165,6 +191,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
+        "--tunnel",
+        default="none",
+        choices=["none", "ngrok"],
+        help="Optional public tunnel provider (use 'ngrok' for Colab public URL).",
+    )
+    parser.add_argument(
+        "--ngrok-authtoken",
+        help="Optional ngrok auth token. If omitted, reads NGROK_AUTHTOKEN env var.",
+    )
+    parser.add_argument(
+        "--ngrok-domain",
+        help="Optional reserved ngrok domain (paid plans).",
+    )
+    parser.add_argument(
+        "--public-url-file",
+        help="Optional path to write the tunnel public URL.",
+    )
+    parser.add_argument(
         "--print-config",
         action="store_true",
         help="Print startup config as JSON before starting the server.",
@@ -174,10 +218,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    public_url, ngrok_module = maybe_start_tunnel(args)
+
+    if public_url:
+        print(f"PUBLIC_URL={public_url}")
+        if args.public_url_file:
+            with open(args.public_url_file, "w", encoding="utf-8") as handle:
+                handle.write(public_url + "\n")
+
     if args.print_config:
-        print(json.dumps(vars(args), indent=2, sort_keys=True))
+        config = vars(args).copy()
+        config["public_url"] = public_url
+        print(json.dumps(config, indent=2, sort_keys=True))
+
     app = build_app(args)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    finally:
+        if public_url and ngrok_module is not None:
+            ngrok_module.disconnect(public_url)
 
 
 if __name__ == "__main__":

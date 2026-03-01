@@ -132,22 +132,29 @@ You can also build native `llama.cpp` manually with:
 You can host a remote vLLM server (for example on Google Colab), expose it via a public URL,
 and run MiniCrunch locally with `--backend vllm`.
 
-### 1) Start vLLM server in Colab
+### 1) Single launch in Colab (vLLM + public URL)
 
 Clone this repo in Colab and run:
 
 ```bash
-pip install "vllm>=0.7" "fastapi>=0.115" "uvicorn>=0.30"
+pip install "vllm>=0.7" "fastapi>=0.115" "uvicorn>=0.30" "pyngrok>=7.2"
+export NGROK_AUTHTOKEN="<your-ngrok-token>"
 python scripts/vllm_http_server.py \
   --model-id mistralai/Ministral-3B-Instruct-2410 \
   --max-model-len 8192 \
   --host 0.0.0.0 \
   --port 8000 \
+  --tunnel ngrok \
   --print-config
 ```
 
-Expose port `8000` publicly using your preferred tunnel (for example `cloudflared` or `ngrok`),
-then copy the HTTPS base URL.
+The script prints a line like:
+
+```text
+PUBLIC_URL=https://abc123.ngrok-free.app
+```
+
+Copy that URL and use it as `--vllm-url` from your laptop.
 
 ### 2) Compress locally using the Colab URL
 
