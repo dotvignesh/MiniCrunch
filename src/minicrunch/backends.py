@@ -104,7 +104,25 @@ class VllmHttpPrior:
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
-            raise RuntimeError(f"vLLM backend request failed ({method} {url}): {exc}") from exc
+            detail_suffix = ""
+            response = getattr(exc, "response", None)
+            if response is not None:
+                parsed: Any = None
+                try:
+                    parsed = response.json()
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict) and "detail" in parsed:
+                    detail_suffix = f" | server detail: {parsed['detail']!r}"
+                elif isinstance(parsed, dict):
+                    detail_suffix = f" | server json: {parsed!r}"
+                else:
+                    text = str(getattr(response, "text", "")).strip()
+                    if text:
+                        detail_suffix = f" | server body: {text[:500]!r}"
+            raise RuntimeError(
+                f"vLLM backend request failed ({method} {url}): {exc}{detail_suffix}"
+            ) from exc
         if not isinstance(data, dict):
             raise RuntimeError(f"Expected JSON object from {url}, got {type(data).__name__}.")
         return data

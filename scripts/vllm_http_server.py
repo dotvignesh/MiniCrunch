@@ -81,7 +81,11 @@ def _generate_with_token_ids(
     signature = inspect.signature(generate_fn)
     parameter_names = set(signature.parameters)
 
-    base_kwargs: dict[str, Any] = {"sampling_params": sampling_params}
+    base_kwargs: dict[str, Any] = {}
+    if "sampling_params" in parameter_names:
+        base_kwargs["sampling_params"] = sampling_params
+    elif "params" in parameter_names:
+        base_kwargs["params"] = sampling_params
     if "use_tqdm" in parameter_names:
         base_kwargs["use_tqdm"] = False
 
@@ -104,6 +108,9 @@ def _generate_with_token_ids(
     if "prompts" in parameter_names:
         add_attempt(prompts=[tokens_prompt])
         add_attempt(prompts=[token_ids])
+    if "prompt" in parameter_names:
+        add_attempt(prompt=tokens_prompt)
+        add_attempt(prompt=token_ids)
     if "inputs" in parameter_names:
         add_attempt(inputs=[tokens_prompt])
         add_attempt(inputs=[token_ids])
@@ -111,22 +118,33 @@ def _generate_with_token_ids(
     # Positional fallbacks for versions with unstable naming.
     add_attempt([tokens_prompt])
     add_attempt([token_ids])
+    add_attempt(tokens_prompt)
+    add_attempt(token_ids)
+    add_attempt([tokens_prompt], sampling_params)
+    add_attempt([token_ids], sampling_params)
+    add_attempt(tokens_prompt, sampling_params)
+    add_attempt(token_ids, sampling_params)
 
     last_error: Exception | None = None
-    for args, kwargs in attempts:
+    attempt_errors: list[str] = []
+    for idx, (args, kwargs) in enumerate(attempts, start=1):
         try:
             return generate_fn(*args, **kwargs)
         except TypeError as exc:
             if not _is_signature_mismatch_error(exc):
                 raise
             last_error = exc
+            attempt_errors.append(f"attempt {idx}: {type(exc).__name__}: {exc}")
         except ValueError as exc:
             if not _is_signature_mismatch_error(exc):
                 raise
             last_error = exc
+            attempt_errors.append(f"attempt {idx}: {type(exc).__name__}: {exc}")
 
+    detail = "; ".join(attempt_errors[-4:])
     raise RuntimeError(
-        "Unable to call vLLM generate() with token IDs for this installed version."
+        "Unable to call vLLM generate() with token IDs for this installed version. "
+        f"Recent errors: {detail}"
     ) from last_error
 
 
