@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Protocol
 import warnings
 
@@ -56,6 +57,7 @@ class VllmHttpPrior:
         self._timeout_seconds = max(1.0, float(config.vllm_timeout_seconds))
         self._top_k = int(config.vllm_top_k)
         self._fallback_logit = float(config.vllm_fallback_logit)
+        self._warned_top_k_clamp = False
         self.dtype_name = "vllm-http"
 
         meta = self._request_json("GET", "/meta")
@@ -127,6 +129,16 @@ class VllmHttpPrior:
             raise RuntimeError(f"Expected JSON object from {url}, got {type(data).__name__}.")
         return data
 
+    def _extract_max_allowed_logprobs(self, error_text: str) -> int | None:
+        match = re.search(r"max allowed:\s*(\d+)", error_text, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
     def reset(self) -> None:
         self._next_token_id = self.bos_token_id
         self._cached_context = []
@@ -136,14 +148,26 @@ class VllmHttpPrior:
         if len(full_context) > self.max_context_tokens:
             full_context = full_context[-self.max_context_tokens :]
 
-        response = self._request_json(
-            "POST",
-            "/next-token-logprobs",
-            payload={
-                "token_ids": full_context,
-                "top_k": self._top_k,
-            },
-        )
+        payload = {
+            "token_ids": full_context,
+            "top_k": self._top_k,
+        }
+        try:
+            response = self._request_json("POST", "/next-token-logprobs", payload=payload)
+        except RuntimeError as exc:
+            max_allowed = self._extract_max_allowed_logprobs(str(exc))
+            if max_allowed is None or max_allowed >= self._top_k:
+                raise
+            self._top_k = max_allowed
+            if not self._warned_top_k_clamp:
+                warnings.warn(
+                    f"Remote vLLM limited --vllm-top-k to {self._top_k}; "
+                    "continuing with the lower value.",
+                    stacklevel=2,
+                )
+                self._warned_top_k_clamp = True
+            payload["top_k"] = self._top_k
+            response = self._request_json("POST", "/next-token-logprobs", payload=payload)
         entries = response.get("top_token_logprobs")
         if not isinstance(entries, list):
             raise RuntimeError("vLLM response missing `top_token_logprobs` list.")

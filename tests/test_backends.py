@@ -178,3 +178,39 @@ def test_vllm_prior_requires_bos_or_eos(monkeypatch) -> None:
                 vllm_url="https://example.ngrok-free.app",
             )
         )
+
+
+def test_vllm_prior_clamps_top_k_on_server_limit(monkeypatch) -> None:
+    fake_requests = _make_fake_requests()
+    monkeypatch.setattr(backends.VllmHttpPrior, "_import_requests", lambda _self: fake_requests)
+
+    prior = backends.VllmHttpPrior(
+        backends.LoadConfig(
+            model_id="mistralai/Ministral-3-3B-Instruct-2512",
+            vllm_url="https://example.ngrok-free.app",
+            vllm_top_k=256,
+        )
+    )
+
+    observed_top_ks: list[int] = []
+
+    def fake_request_json(method: str, path: str, payload: dict | None = None) -> dict:
+        assert method == "POST"
+        assert path == "/next-token-logprobs"
+        assert payload is not None
+        observed_top_ks.append(int(payload["top_k"]))
+        if len(observed_top_ks) == 1:
+            raise RuntimeError(
+                "vLLM backend request failed (POST /next-token-logprobs): "
+                "500 ... Requested sample logprobs of 256, "
+                "which is greater than max allowed: 20"
+            )
+        return {"top_token_logprobs": [{"token_id": 2, "logprob": -0.25}]}
+
+    monkeypatch.setattr(prior, "_request_json", fake_request_json)
+
+    with pytest.warns(UserWarning, match="limited --vllm-top-k to 20"):
+        logits = prior.next_logits()
+
+    assert logits.shape[0] == 6
+    assert observed_top_ks == [256, 20]
