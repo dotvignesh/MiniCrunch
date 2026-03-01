@@ -42,11 +42,11 @@ def _read_text(args: argparse.Namespace) -> str:
 def _load_prior_from_args(args: argparse.Namespace, model_id: str):
     return load_prior(
         model_id=model_id,
-        vllm_url=args.vllm_url,
-        vllm_top_k=args.vllm_top_k,
-        vllm_timeout_seconds=args.vllm_timeout_seconds,
-        vllm_fallback_logit=args.vllm_fallback_logit,
-        vllm_max_context=args.vllm_max_context,
+        server_url=args.server_url,
+        top_k=args.top_k,
+        timeout_seconds=args.timeout_seconds,
+        fallback_logit=args.fallback_logit,
+        max_context=args.max_context,
     )
 
 
@@ -179,7 +179,7 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="minicrunch",
-        description="vLLM-based arithmetic-coding demo with mistralai/Ministral-3-3B-Instruct-2512",
+        description="Transformers-WebSocket arithmetic-coding demo with mistralai/Ministral-3-3B-Instruct-2512",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -189,35 +189,35 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             subparser.add_argument("--model-id")
 
-    def add_vllm_args(subparser: argparse.ArgumentParser) -> None:
+    def add_server_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument(
-            "--vllm-url",
+            "--server-url",
             required=True,
-            help="Base URL for remote vLLM logits server",
+            help="Base URL for remote Transformers WebSocket server (http(s) or ws(s)).",
         )
         subparser.add_argument(
-            "--vllm-top-k",
+            "--top-k",
             type=int,
             default=256,
-            help="Top-K logprobs requested from vLLM server",
+            help="Top-K logprobs requested per token step.",
         )
         subparser.add_argument(
-            "--vllm-timeout-seconds",
+            "--timeout-seconds",
             type=float,
             default=60.0,
-            help="HTTP timeout per vLLM request",
+            help="Request timeout for WebSocket operations.",
         )
         subparser.add_argument(
-            "--vllm-fallback-logit",
+            "--fallback-logit",
             type=float,
             default=-50.0,
-            help="Logit assigned to tokens outside vLLM top-k set",
+            help="Logit assigned to tokens outside top-k.",
         )
         subparser.add_argument(
-            "--vllm-max-context",
+            "--max-context",
             type=int,
             default=8192,
-            help="Fallback max context when server /meta does not return max_model_len",
+            help="Maximum rolling context window used by the remote session.",
         )
 
     compress_parser = subparsers.add_parser("compress", help="Compress a UTF-8 text file")
@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     compress_parser.add_argument("--total-freq", type=int, default=1 << 20)
     compress_parser.add_argument("--progress-every", type=int, default=100)
     add_model_args(compress_parser, with_default=True)
-    add_vllm_args(compress_parser)
+    add_server_args(compress_parser)
     compress_parser.set_defaults(func=cmd_compress)
 
     decompress_parser = subparsers.add_parser("decompress", help="Decompress an archive")
@@ -235,7 +235,7 @@ def build_parser() -> argparse.ArgumentParser:
     decompress_parser.add_argument("--progress-every", type=int, default=100)
     decompress_parser.add_argument("--no-verify", action="store_true")
     add_model_args(decompress_parser, with_default=False)
-    add_vllm_args(decompress_parser)
+    add_server_args(decompress_parser)
     decompress_parser.set_defaults(func=cmd_decompress)
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Run compression benchmark")
@@ -247,7 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--output-archive", help="Optional archive output path")
     benchmark_parser.add_argument("--output-decoded", help="Optional decoded text output path")
     add_model_args(benchmark_parser, with_default=True)
-    add_vllm_args(benchmark_parser)
+    add_server_args(benchmark_parser)
     benchmark_parser.set_defaults(func=cmd_benchmark)
 
     return parser

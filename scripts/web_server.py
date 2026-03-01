@@ -2,7 +2,7 @@
 """MiniCrunch Web UI — Wormhole-style file sharing with LLM compression.
 
 Usage:
-    python scripts/web_server.py --vllm-url http://localhost:8001 --port 8080
+    python scripts/web_server.py --server-url ws://localhost:8000/ws --port 8080
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from minicrunch.codec import compress_text, decompress_archive
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 _cfg: dict = {
-    "vllm_url": os.environ.get("MINICRUNCH_VLLM_URL", "http://localhost:8001"),
+    "server_url": os.environ.get("MINICRUNCH_SERVER_URL", "ws://localhost:8000/ws"),
     "model_id": "mistralai/Ministral-3-3B-Instruct-2512",
 }
 
@@ -47,11 +47,11 @@ app = FastAPI(title="MiniCrunch")
 def _make_prior():
     return load_prior(
         model_id=_cfg["model_id"],
-        vllm_url=_cfg["vllm_url"],
-        vllm_top_k=256,
-        vllm_timeout_seconds=120.0,
-        vllm_fallback_logit=-50.0,
-        vllm_max_context=8192,
+        server_url=_cfg["server_url"],
+        top_k=256,
+        timeout_seconds=120.0,
+        fallback_logit=-50.0,
+        max_context=8192,
     )
 
 
@@ -901,9 +901,9 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Bind port (default: 8080)")
     parser.add_argument(
-        "--vllm-url",
-        default=_cfg["vllm_url"],
-        help="Base URL of the vLLM logits server (default: %(default)s)",
+        "--server-url",
+        default=_cfg["server_url"],
+        help="Base URL of the Transformers WebSocket server (default: %(default)s)",
     )
     parser.add_argument(
         "--model-id",
@@ -912,12 +912,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    _cfg["vllm_url"] = args.vllm_url
+    _cfg["server_url"] = args.server_url
     _cfg["model_id"] = args.model_id
 
-    print(f"  MiniCrunch Web UI")
+    print("  MiniCrunch Web UI")
     print(f"  URL    : http://localhost:{args.port}")
-    print(f"  vLLM   : {args.vllm_url}")
+    print(f"  Server : {args.server_url}")
     print(f"  Model  : {args.model_id}")
     print()
 

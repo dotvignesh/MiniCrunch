@@ -1,13 +1,14 @@
 [project]
 name = "minicrunch"
 version = "0.1.0"
-description = "LLM arithmetic coding demo using mistralai/Ministral-3-3B-Instruct-2512"
+description = "LLM arithmetic coding demo using a remote Transformers WebSocket prior"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
   "requests>=2.32",
   "torch>=2.4",
+  "websockets>=16.0",
   "zstandard>=0.23",
 ]
 
@@ -15,8 +16,8 @@ dependencies = [
 server = [
   "fastapi>=0.115",
   "pyngrok>=7.2",
+  "transformers>=4.50",
   "uvicorn>=0.30",
-  "vllm>=0.7",
 ]
 dev = [
   "pytest>=8.0",
