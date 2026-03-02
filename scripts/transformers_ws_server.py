@@ -2,17 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+import sys
+import threading
 from typing import Any
 import uuid
 
 import torch
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+from minicrunch.codec import compress_text, decompress_archive
 
 
 def _resolve_dtype(dtype_name: str, device_type: str) -> torch.dtype:
@@ -200,6 +208,69 @@ class Runtime:
         )
 
 
+class RuntimeLocalPrior:
+    """In-process PriorModel adapter so compression work stays on the model host."""
+
+    backend = "transformers-ws"
+
+    def __init__(
+        self,
+        runtime: Runtime,
+        *,
+        top_k: int,
+        max_context: int,
+        fallback_logit: float,
+    ) -> None:
+        self._runtime = runtime
+        self._top_k = max(1, min(int(top_k), runtime.vocab_size))
+        self._max_context = max(1, int(max_context))
+        self._fallback_logit = float(fallback_logit)
+
+        self.model_id = runtime.model_id
+        self.dtype_name = runtime.dtype_name
+        self.vocab_size = runtime.vocab_size
+        self.bos_token_id = runtime.bos_token_id
+
+        self._state = SessionState(
+            session_id=str(uuid.uuid4()),
+            initialized=True,
+            max_context_tokens=self._max_context,
+            default_top_k=self._top_k,
+        )
+        self._next_token_id = self.bos_token_id
+
+    def reset(self) -> None:
+        self._state.reset()
+        self._next_token_id = self.bos_token_id
+
+    def next_logits(self) -> torch.Tensor:
+        entries = self._runtime.step(
+            state=self._state,
+            token_id=int(self._next_token_id),
+            top_k=self._top_k,
+        )
+        logits = torch.full(
+            (self.vocab_size,),
+            self._fallback_logit,
+            dtype=torch.float32,
+        )
+        for entry in entries:
+            token_id = int(entry.get("token_id", -1))
+            logprob = float(entry.get("logprob", self._fallback_logit))
+            if 0 <= token_id < self.vocab_size:
+                logits[token_id] = logprob
+        return logits
+
+    def accept_token(self, token_id: int) -> None:
+        self._next_token_id = int(token_id)
+
+    def encode_text(self, text: str) -> list[int]:
+        return self._runtime.tokenize(text)
+
+    def decode_tokens(self, token_ids: list[int]) -> str:
+        return self._runtime.detokenize(token_ids)
+
+
 def _build_model_kwargs(
     *,
     dtype: torch.dtype,
@@ -304,6 +375,18 @@ def _json(payload: dict[str, Any]) -> str:
 def build_app(args: argparse.Namespace) -> FastAPI:
     runtime = Runtime(args)
     app = FastAPI(title="MiniCrunch Transformers WebSocket server", version="2.0")
+    runtime_lock = threading.Lock()
+
+    def _make_local_prior(payload: dict[str, Any]) -> RuntimeLocalPrior:
+        top_k = int(payload.get("top_k", runtime.default_top_k))
+        max_context = int(payload.get("max_context", runtime.default_max_context))
+        fallback_logit = float(payload.get("fallback_logit", -50.0))
+        return RuntimeLocalPrior(
+            runtime=runtime,
+            top_k=top_k,
+            max_context=max_context,
+            fallback_logit=fallback_logit,
+        )
 
     @app.get("/")
     def root() -> dict[str, Any]:
@@ -314,6 +397,67 @@ def build_app(args: argparse.Namespace) -> FastAPI:
             "loader": runtime.model_loader_name,
             "vocab_size": runtime.vocab_size,
             "ws_path": "/ws",
+            "api_paths": ["/api/compress", "/api/decompress"],
+        }
+
+    @app.post("/api/compress")
+    def api_compress(payload: dict[str, Any]) -> dict[str, Any]:
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(status_code=400, detail="`text` must be a string.")
+
+        total_freq = int(payload.get("total_freq", 1 << 20))
+        if total_freq <= 0:
+            raise HTTPException(status_code=400, detail="`total_freq` must be > 0.")
+
+        prior = _make_local_prior(payload)
+        with runtime_lock:
+            result = compress_text(
+                text=text,
+                prior=prior,
+                total_freq=total_freq,
+                progress_every=0,
+                progress_callback=None,
+            )
+
+        return {
+            "ok": True,
+            "archive_b64": base64.b64encode(result.archive).decode("ascii"),
+            "payload_bits": result.payload_bits,
+            "token_count": result.token_count,
+            "elapsed_seconds": result.elapsed_seconds,
+            "header": result.header,
+            "compressed_size": len(result.archive),
+            "original_size": int(result.header.get("original_bytes", 0)),
+        }
+
+    @app.post("/api/decompress")
+    def api_decompress(payload: dict[str, Any]) -> dict[str, Any]:
+        archive_b64 = payload.get("archive_b64")
+        if not isinstance(archive_b64, str) or not archive_b64:
+            raise HTTPException(status_code=400, detail="`archive_b64` must be a non-empty string.")
+        try:
+            archive = base64.b64decode(archive_b64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 archive: {exc}") from exc
+
+        verify_hash = bool(payload.get("verify_hash", True))
+        prior = _make_local_prior(payload)
+        with runtime_lock:
+            result = decompress_archive(
+                archive=archive,
+                prior=prior,
+                progress_every=0,
+                progress_callback=None,
+                verify_hash=verify_hash,
+            )
+
+        return {
+            "ok": True,
+            "text": result.text,
+            "token_count": result.token_count,
+            "elapsed_seconds": result.elapsed_seconds,
+            "header": result.header,
         }
 
     @app.websocket("/ws")

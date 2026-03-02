@@ -6,12 +6,18 @@ Usage:
 """
 from __future__ import annotations
 
+import base64
+import gzip
 import html as _html
 import os
 import tempfile
 import threading
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
+
+import requests
+import zstandard as zstd
 
 try:
     from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -33,6 +39,8 @@ from minicrunch.codec import compress_text, decompress_archive
 _cfg: dict = {
     "server_url": os.environ.get("MINICRUNCH_SERVER_URL", "ws://localhost:8000/ws"),
     "model_id": "mistralai/Ministral-3-3B-Instruct-2512",
+    "top_k": int(os.environ.get("MINICRUNCH_TOP_K", "64")),
+    "max_context": int(os.environ.get("MINICRUNCH_MAX_CONTEXT", "4096")),
 }
 
 _STORE = Path(tempfile.gettempdir()) / "minicrunch_web"
@@ -44,14 +52,112 @@ _files: dict[str, dict] = {}
 app = FastAPI(title="MiniCrunch")
 
 
+def _pct_of_original(size: int, original: int) -> float:
+    if original <= 0:
+        return 0.0
+    return (size / original) * 100.0
+
+
+def _reduction_pct(size: int, original: int) -> float:
+    return max(0.0, 100.0 - _pct_of_original(size=size, original=original))
+
+
+def _build_benchmark_stats(source_bytes: bytes, minicrunch_size: int) -> dict:
+    original_size = len(source_bytes)
+    gzip_size = len(gzip.compress(source_bytes, compresslevel=9))
+    zstd_size = len(zstd.ZstdCompressor(level=19).compress(source_bytes))
+
+    minicrunch_reduction = _reduction_pct(size=minicrunch_size, original=original_size)
+    gzip_reduction = _reduction_pct(size=gzip_size, original=original_size)
+    zstd_reduction = _reduction_pct(size=zstd_size, original=original_size)
+
+    return {
+        "minicrunch_reduction_pct": minicrunch_reduction,
+        "gzip_reduction_pct": gzip_reduction,
+        "zstd_reduction_pct": zstd_reduction,
+        "vs_gzip_pp": minicrunch_reduction - gzip_reduction,
+        "vs_zstd_pp": minicrunch_reduction - zstd_reduction,
+    }
+
+
+def _api_base_url(server_url: str) -> str:
+    parsed = urlparse(server_url.strip())
+    if not parsed.scheme:
+        raise ValueError("Server URL must include a scheme.")
+
+    scheme = parsed.scheme
+    if scheme == "ws":
+        scheme = "http"
+    elif scheme == "wss":
+        scheme = "https"
+
+    path = parsed.path or ""
+    if path.endswith("/ws"):
+        path = path[: -len("/ws")]
+
+    return urlunparse((scheme, parsed.netloc, path.rstrip("/"), "", "", ""))
+
+
+def _remote_compress(text: str, *, top_k: int, max_context: int) -> dict:
+    base = _api_base_url(_cfg["server_url"])
+    response = requests.post(
+        f"{base}/api/compress",
+        json={
+            "text": text,
+            "top_k": int(top_k),
+            "max_context": int(max_context),
+            "fallback_logit": -50.0,
+            "total_freq": 1 << 20,
+        },
+        timeout=600,
+    )
+    if response.status_code >= 400:
+        detail = response.text.strip()
+        raise RuntimeError(f"Remote compress failed ({response.status_code}): {detail}")
+    payload = response.json()
+    archive_b64 = payload.get("archive_b64")
+    if not isinstance(archive_b64, str):
+        raise RuntimeError("Remote compress response missing `archive_b64`.")
+    archive = base64.b64decode(archive_b64)
+    return {
+        "archive": archive,
+        "payload_bits": int(payload.get("payload_bits", 0)),
+        "token_count": int(payload.get("token_count", 0)),
+        "header": payload.get("header") or {},
+    }
+
+
+def _remote_decompress(archive: bytes, *, top_k: int, max_context: int) -> str:
+    base = _api_base_url(_cfg["server_url"])
+    response = requests.post(
+        f"{base}/api/decompress",
+        json={
+            "archive_b64": base64.b64encode(archive).decode("ascii"),
+            "top_k": int(top_k),
+            "max_context": int(max_context),
+            "fallback_logit": -50.0,
+            "verify_hash": True,
+        },
+        timeout=600,
+    )
+    if response.status_code >= 400:
+        detail = response.text.strip()
+        raise RuntimeError(f"Remote decompress failed ({response.status_code}): {detail}")
+    payload = response.json()
+    text = payload.get("text")
+    if not isinstance(text, str):
+        raise RuntimeError("Remote decompress response missing `text`.")
+    return text
+
+
 def _make_prior():
     return load_prior(
         model_id=_cfg["model_id"],
         server_url=_cfg["server_url"],
-        top_k=256,
+        top_k=int(_cfg["top_k"]),
         timeout_seconds=120.0,
         fallback_logit=-50.0,
-        max_context=8192,
+        max_context=int(_cfg["max_context"]),
     )
 
 
@@ -59,17 +165,42 @@ def _make_prior():
 def _compress_job(job_id: str, text: str, original_name: str) -> None:
     try:
         _jobs[job_id]["status"] = "compressing"
-        prior = _make_prior()
-        result = compress_text(text=text, prior=prior)
+        try:
+            remote = _remote_compress(
+                text,
+                top_k=int(_cfg["top_k"]),
+                max_context=int(_cfg["max_context"]),
+            )
+            archive = remote["archive"]
+            payload_bits = int(remote["payload_bits"])
+            token_count = int(remote["token_count"])
+            header = remote.get("header") or {}
+            original_size = int(header.get("original_bytes", len(text.encode("utf-8"))))
+        except Exception:
+            # Backward-compatible fallback when remote API is unavailable.
+            prior = _make_prior()
+            result = compress_text(text=text, prior=prior)
+            archive = result.archive
+            payload_bits = result.payload_bits
+            token_count = result.token_count
+            header = result.header
+            original_size = int(result.header.get("original_bytes", len(text.encode("utf-8"))))
+
+        source_bytes = text.encode("utf-8")
+        benchmark = _build_benchmark_stats(
+            source_bytes=source_bytes,
+            minicrunch_size=len(archive),
+        )
         fid = str(uuid.uuid4())
         path = _STORE / f"{fid}.mcz"
-        path.write_bytes(result.archive)
+        path.write_bytes(archive)
         _files[fid] = {
             "mcz_path": str(path),
             "original_name": original_name,
-            "compressed_size": len(result.archive),
-            "original_size": result.header["original_bytes"],
-            "token_count": result.token_count,
+            "compressed_size": len(archive),
+            "original_size": original_size,
+            "token_count": token_count,
+            "benchmark": benchmark,
         }
         _jobs[job_id] = {
             "status": "done",
@@ -77,10 +208,11 @@ def _compress_job(job_id: str, text: str, original_name: str) -> None:
             "result": {
                 "file_id": fid,
                 "original_name": original_name,
-                "compressed_size": len(result.archive),
-                "original_size": result.header["original_bytes"],
-                "token_count": result.token_count,
-                "payload_bits": result.payload_bits,
+                "compressed_size": len(archive),
+                "original_size": original_size,
+                "token_count": token_count,
+                "payload_bits": payload_bits,
+                "benchmark": benchmark,
             },
         }
     except Exception as exc:
@@ -94,10 +226,20 @@ def _decompress_job(job_id: str, file_id: str) -> None:
         if not info:
             raise ValueError("File not found")
         archive = Path(info["mcz_path"]).read_bytes()
-        prior = _make_prior()
-        result = decompress_archive(archive=archive, prior=prior)
+        try:
+            text = _remote_decompress(
+                archive,
+                top_k=int(_cfg["top_k"]),
+                max_context=int(_cfg["max_context"]),
+            )
+        except Exception:
+            # Backward-compatible fallback when remote API is unavailable.
+            prior = _make_prior()
+            result = decompress_archive(archive=archive, prior=prior)
+            text = result.text
+
         out_path = _STORE / f"{job_id}.txt"
-        out_path.write_text(result.text, encoding="utf-8")
+        out_path.write_text(text, encoding="utf-8")
         _jobs[job_id] = {
             "status": "done",
             "out_path": str(out_path),
@@ -180,9 +322,19 @@ async def get_file(job_id: str):
 _SHARED_CSS = """
   *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
 
+  :root {
+    --bg: #080808;
+    --mistral-orange: #ff7a00;
+    --mistral-orange-light: #ffb066;
+    --mistral-orange-deep: #d95e00;
+    --mistral-ink: #141c2e;
+    --mistral-blue: #385d9f;
+    --mistral-blue-light: #6f8dc2;
+  }
+
   html, body {
     height: 100%;
-    background: #080808;
+    background: var(--bg);
     color: #fff;
     font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
@@ -200,14 +352,45 @@ _SHARED_CSS = """
   .pac-dot {
     position: absolute;
     border-radius: 50%;
-    background: #FFD700;
+    background: radial-gradient(circle, var(--mistral-blue-light) 0%, var(--mistral-blue) 100%);
+    box-shadow: 0 0 8px rgba(56, 93, 159, 0.28);
     transform: translate(-50%, -50%);
   }
   .pac-man {
     position: absolute;
     border-radius: 50%;
-    background: #FFD700;
+    background: radial-gradient(
+      circle at 35% 32%,
+      var(--mistral-orange-light) 0%,
+      var(--mistral-orange) 60%,
+      var(--mistral-orange-deep) 100%
+    );
     transform: translate(-50%, -50%);
+    filter: drop-shadow(0 0 10px rgba(255, 122, 0, 0.35));
+  }
+  .pac-man::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 58%;
+    height: 58%;
+    background: var(--bg);
+    clip-path: polygon(0 50%, 100% 0, 100% 100%);
+    transform-origin: left center;
+    transform: translate(0, -50%) rotate(32deg);
+    animation: pac-mouth 0.26s ease-in-out infinite;
+  }
+  .pac-man::after {
+    content: '';
+    position: absolute;
+    top: 24%;
+    left: 60%;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--mistral-ink);
+    opacity: 0.95;
   }
 
   /* ─── Layout ─── */
@@ -379,17 +562,46 @@ _SHARED_CSS = """
     gap: 20px;
   }
   .mini-pac {
+    position: relative;
     display: inline-block;
     width: 52px;
     height: 52px;
-    background: #FFD700;
+    background: radial-gradient(
+      circle at 35% 32%,
+      var(--mistral-orange-light) 0%,
+      var(--mistral-orange) 60%,
+      var(--mistral-orange-deep) 100%
+    );
     border-radius: 50%;
-    box-shadow: 0 0 20px rgba(255,215,0,0.35);
-    animation: ui-chomp 0.28s linear infinite;
+    box-shadow: 0 0 22px rgba(255, 122, 0, 0.33);
   }
-  @keyframes ui-chomp {
-    0%, 100% { clip-path: polygon(100% 40%, 0% 0%, 0% 100%, 100% 60%); }
-    50%       { clip-path: polygon(100% 50%, 0% 0%, 0% 100%, 100% 50%); }
+  .mini-pac::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 58%;
+    height: 58%;
+    background: var(--bg);
+    clip-path: polygon(0 50%, 100% 0, 100% 100%);
+    transform-origin: left center;
+    transform: translate(0, -50%) rotate(32deg);
+    animation: pac-mouth 0.28s ease-in-out infinite;
+  }
+  .mini-pac::after {
+    content: '';
+    position: absolute;
+    top: 24%;
+    left: 60%;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--mistral-ink);
+    opacity: 0.95;
+  }
+  @keyframes pac-mouth {
+    0%, 100% { transform: translate(0, -50%) rotate(32deg); }
+    50%       { transform: translate(0, -50%) rotate(8deg); }
   }
   .progress-label {
     font-size: 15px;
@@ -443,6 +655,33 @@ _SHARED_CSS = """
   }
   .copy-btn:hover { background: rgba(255,215,0,0.2); }
   .link-hint { font-size: 12px; color: #3c3c3c; }
+  .benchmark-box {
+    margin-top: 14px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 122, 0, 0.2);
+    background:
+      linear-gradient(180deg, rgba(255, 122, 0, 0.08) 0%, rgba(20, 28, 46, 0.18) 100%);
+    text-align: left;
+  }
+  .benchmark-title {
+    color: #ffcf9f;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  .benchmark-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: 13px;
+    color: #a9b7d0;
+    line-height: 1.5;
+  }
+  .benchmark-row strong { color: #fff; }
+  .benchmark-delta { color: #ffcf9f; }
 
   /* ─── Error ─── */
   .error-icon  { font-size: 38px; color: #ff6b6b; margin-bottom: 12px; }
@@ -477,10 +716,6 @@ _PACMAN_BG_JS = """
   var cssRules = [];
 
   cssRules.push(
-    '@keyframes pac-chomp {' +
-    '  0%,100%{ clip-path: polygon(100% 40%, 0% 0%, 0% 100%, 100% 60%); }' +
-    '  50%    { clip-path: polygon(100% 50%, 0% 0%, 0% 100%, 100% 50%); }' +
-    '}' +
     '@keyframes pac-move {' +
     '  from { left: -40px; }' +
     '  to   { left: calc(100vw + 40px); }' +
@@ -498,9 +733,8 @@ _PACMAN_BG_JS = """
       'top:' + yPct + 'vh;' +
       'width:' + PAC_SIZE + 'px;' +
       'height:' + PAC_SIZE + 'px;' +
-      'opacity:0.45;' +
-      'animation:pac-chomp 0.26s linear infinite,' +
-      '           pac-move ' + PAC_DUR + 's linear -' + rowOff + 's infinite;';
+      'opacity:0.52;' +
+      'animation:pac-move ' + PAC_DUR + 's linear -' + rowOff + 's infinite;';
     bg.appendChild(pac);
 
     /* Dots */
@@ -513,10 +747,10 @@ _PACMAN_BG_JS = """
 
       cssRules.push(
         '@keyframes ' + aName + ' {' +
-        '  0%,' + eatPct + '% { opacity:0.17; }' +
+        '  0%,' + eatPct + '% { opacity:0.32; }' +
         '  ' + endPct + '%   { opacity:0;    }' +
         '  99.9%              { opacity:0;    }' +
-        '  100%               { opacity:0.17; }' +
+        '  100%               { opacity:0.32; }' +
         '}'
       );
 
@@ -591,6 +825,13 @@ _UPLOAD_PAGE = (
       <div class="done-check">&#10003;</div>
       <div class="card-title" style="color:#4eff91">Compressed!</div>
       <div class="card-sub" id="done-meta" style="margin-bottom:4px"></div>
+      <div class="benchmark-box" id="benchmark-box" style="display:none">
+        <div class="benchmark-title">Reduction vs benchmark</div>
+        <div class="benchmark-row"><span>MiniCrunch</span><strong id="bench-minicrunch">--</strong></div>
+        <div class="benchmark-row"><span>gzip -9</span><strong id="bench-gzip">--</strong></div>
+        <div class="benchmark-row"><span>zstd -19</span><strong id="bench-zstd">--</strong></div>
+        <div class="benchmark-row benchmark-delta"><span>Lead vs gzip / zstd</span><strong id="bench-delta">--</strong></div>
+      </div>
       <div class="link-row">
         <span class="link-text" id="share-link-text"></span>
         <button class="copy-btn" id="copy-btn" onclick="copyLink()">Copy</button>
@@ -618,6 +859,26 @@ var fileInput = document.getElementById('file-input');
 var card      = document.getElementById('card');
 var shareUrl  = '';
 var pollTimer = null;
+
+function triggerFileDownload(jobId) {
+  var frame = document.getElementById('download-frame');
+  if (!frame) {
+    frame = document.createElement('iframe');
+    frame.id = 'download-frame';
+    frame.style.display = 'none';
+    document.body.appendChild(frame);
+  }
+  frame.src = '/get-file/' + jobId + '?ts=' + Date.now();
+}
+
+function formatPct(value) {
+  return (typeof value === 'number' && isFinite(value)) ? value.toFixed(1) + '%' : '--';
+}
+
+function formatDelta(value) {
+  if (typeof value !== 'number' || !isFinite(value)) return '--';
+  return (value >= 0 ? '+' : '') + value.toFixed(1) + ' pp';
+}
 
 /* ── Drag-and-drop ── */
 document.addEventListener('dragover', function(e){ e.preventDefault(); card.classList.add('drag-over'); });
@@ -676,13 +937,27 @@ function pollJob(jobId, mode) {
             shareUrl = window.location.origin + '/d/' + r.file_id;
             var origKB = (r.original_size  / 1024).toFixed(1);
             var compKB = (r.compressed_size / 1024).toFixed(1);
-            var pct    = (r.compressed_size / r.original_size * 100).toFixed(1);
+            var sourceSize = r.original_size > 0 ? r.original_size : 1;
+            var ratioPct = (r.compressed_size / sourceSize) * 100;
+            var pct = ratioPct.toFixed(1);
+            var benchmark = r.benchmark || {};
+            var defaultReduction = r.original_size > 0 ? (100 - ratioPct) : 0;
+            var miniReduction = (typeof benchmark.minicrunch_reduction_pct === 'number')
+              ? benchmark.minicrunch_reduction_pct
+              : defaultReduction;
             document.getElementById('done-meta').textContent =
               r.original_name + ' \u00b7 ' + origKB + ' KB \u2192 ' + compKB + ' KB (' + pct + '%) \u00b7 ' + r.token_count.toLocaleString() + ' tokens';
+            document.getElementById('bench-minicrunch').textContent = formatPct(miniReduction);
+            document.getElementById('bench-gzip').textContent = formatPct(benchmark.gzip_reduction_pct);
+            document.getElementById('bench-zstd').textContent = formatPct(benchmark.zstd_reduction_pct);
+            document.getElementById('bench-delta').textContent =
+              formatDelta(benchmark.vs_gzip_pp) + ' / ' + formatDelta(benchmark.vs_zstd_pp);
+            document.getElementById('benchmark-box').style.display = '';
             document.getElementById('share-link-text').textContent = shareUrl;
             setState('done');
           } else {
-            window.location.href = '/get-file/' + jobId;
+            setState('default');
+            triggerFileDownload(jobId);
           }
         } else if (job.status === 'error') {
           clearInterval(pollTimer);
@@ -704,6 +979,7 @@ function setState(s) {
 
 function resetUI() {
   if (pollTimer) clearInterval(pollTimer);
+  document.getElementById('benchmark-box').style.display = 'none';
   setState('default');
 }
 
@@ -753,11 +1029,39 @@ def _render_download_page(file_id: str, info: dict) -> str:
     safe_name = _html.escape(info["original_name"])
     orig_kb = f"{info['original_size'] / 1024:.1f}"
     comp_kb = f"{info['compressed_size'] / 1024:.1f}"
-    ratio = (
-        f"{info['compressed_size'] / info['original_size'] * 100:.1f}"
+    ratio_value = (
+        (info["compressed_size"] / info["original_size"]) * 100.0
         if info["original_size"]
-        else "0.0"
+        else 0.0
     )
+    ratio = f"{ratio_value:.1f}"
+    benchmark = info.get("benchmark") or {}
+
+    def _as_float(value):
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    minicrunch_reduction = _as_float(benchmark.get("minicrunch_reduction_pct"))
+    if minicrunch_reduction is None:
+        minicrunch_reduction = max(0.0, 100.0 - ratio_value)
+    gzip_reduction = _as_float(benchmark.get("gzip_reduction_pct"))
+    zstd_reduction = _as_float(benchmark.get("zstd_reduction_pct"))
+
+    vs_gzip = _as_float(benchmark.get("vs_gzip_pp"))
+    if vs_gzip is None and gzip_reduction is not None:
+        vs_gzip = minicrunch_reduction - gzip_reduction
+
+    vs_zstd = _as_float(benchmark.get("vs_zstd_pp"))
+    if vs_zstd is None and zstd_reduction is not None:
+        vs_zstd = minicrunch_reduction - zstd_reduction
+
+    min_reduction_text = f"{minicrunch_reduction:.1f}%"
+    gzip_reduction_text = f"{gzip_reduction:.1f}%" if gzip_reduction is not None else "n/a"
+    zstd_reduction_text = f"{zstd_reduction:.1f}%" if zstd_reduction is not None else "n/a"
+    vs_gzip_text = f"{vs_gzip:+.1f} pp" if vs_gzip is not None else "n/a"
+    vs_zstd_text = f"{vs_zstd:+.1f} pp" if vs_zstd is not None else "n/a"
+    lead_text = f"{vs_gzip_text} / {vs_zstd_text}"
     tokens = f"{info['token_count']:,}"
     safe_fid = _html.escape(file_id)
 
@@ -804,6 +1108,21 @@ def _render_download_page(file_id: str, info: dict) -> str:
         + """% ratio &middot; """
         + tokens
         + """ tokens</div>
+      <div class="benchmark-box">
+        <div class="benchmark-title">Reduction vs benchmark</div>
+        <div class="benchmark-row"><span>MiniCrunch</span><strong>"""
+        + min_reduction_text
+        + """</strong></div>
+        <div class="benchmark-row"><span>gzip -9</span><strong>"""
+        + gzip_reduction_text
+        + """</strong></div>
+        <div class="benchmark-row"><span>zstd -19</span><strong>"""
+        + zstd_reduction_text
+        + """</strong></div>
+        <div class="benchmark-row benchmark-delta"><span>Lead vs gzip / zstd</span><strong>"""
+        + lead_text
+        + """</strong></div>
+      </div>
       <button class="btn-green" onclick="startDownload('"""
         + safe_fid
         + """')">
@@ -837,6 +1156,17 @@ def _render_download_page(file_id: str, info: dict) -> str:
         + """
 
 var pollTimer = null;
+
+function triggerFileDownload(jobId) {
+  var frame = document.getElementById('download-frame');
+  if (!frame) {
+    frame = document.createElement('iframe');
+    frame.id = 'download-frame';
+    frame.style.display = 'none';
+    document.body.appendChild(frame);
+  }
+  frame.src = '/get-file/' + jobId + '?ts=' + Date.now();
+}
 
 function setState(s) {
   ['default','progress','error'].forEach(function(id){
@@ -876,7 +1206,8 @@ function pollJob(jobId) {
       .then(function(job) {
         if (job.status === 'done') {
           clearInterval(pollTimer);
-          window.location.href = '/get-file/' + jobId;
+          setState('default');
+          triggerFileDownload(jobId);
         } else if (job.status === 'error') {
           clearInterval(pollTimer);
           setState('error');
@@ -903,22 +1234,42 @@ def main() -> None:
     parser.add_argument(
         "--server-url",
         default=_cfg["server_url"],
-        help="Base URL of the Transformers WebSocket server (default: %(default)s)",
+        help=(
+            "Transformers server URL. Supports ws(s)://.../ws for legacy WS mode, "
+            "or http(s)://... for offloaded /api/compress + /api/decompress mode "
+            "(default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--model-id",
         default=_cfg["model_id"],
         help="Model ID to use for compression (default: %(default)s)",
     )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=int(_cfg["top_k"]),
+        help="Top-k used for model scoring (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-context",
+        type=int,
+        default=int(_cfg["max_context"]),
+        help="Max context window used on model server (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     _cfg["server_url"] = args.server_url
     _cfg["model_id"] = args.model_id
+    _cfg["top_k"] = max(1, int(args.top_k))
+    _cfg["max_context"] = max(1, int(args.max_context))
 
     print("  MiniCrunch Web UI")
     print(f"  URL    : http://localhost:{args.port}")
     print(f"  Server : {args.server_url}")
     print(f"  Model  : {args.model_id}")
+    print(f"  Top-k  : {_cfg['top_k']}")
+    print(f"  MaxCtx : {_cfg['max_context']}")
     print()
 
     uvicorn.run(app, host=args.host, port=args.port)
