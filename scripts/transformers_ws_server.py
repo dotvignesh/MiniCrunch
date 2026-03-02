@@ -134,7 +134,7 @@ class Runtime:
         except TypeError:
             return self.tokenizer.decode(token_ids, skip_special_tokens=False)
 
-    def step(self, state: SessionState, token_id: int, top_k: int) -> list[dict[str, float]]:
+    def _advance_and_get_logits(self, state: SessionState, token_id: int) -> torch.Tensor:
         if token_id < 0 or token_id >= self.vocab_size:
             raise ValueError(f"token_id out of range: {token_id}")
 
@@ -164,16 +164,43 @@ class Runtime:
                 )
 
         state.past_key_values = outputs.past_key_values
-        logits = outputs.logits[0, -1]
+        return outputs.logits[0, -1]
 
+    def _top_logprobs(self, logits: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         request_top_k = max(1, min(int(top_k), self.vocab_size))
         logprobs = torch.log_softmax(logits.float(), dim=-1)
         top_logprobs, top_indices = torch.topk(logprobs, k=request_top_k)
+        return top_logprobs, top_indices
+
+    def step(self, state: SessionState, token_id: int, top_k: int) -> list[dict[str, float]]:
+        logits = self._advance_and_get_logits(state=state, token_id=token_id)
+        top_logprobs, top_indices = self._top_logprobs(logits=logits, top_k=top_k)
 
         entries: list[dict[str, float]] = []
         for idx, logprob in zip(top_indices.tolist(), top_logprobs.tolist()):
             entries.append({"token_id": int(idx), "logprob": float(logprob)})
         return entries
+
+    def step_dense_logits(
+        self,
+        state: SessionState,
+        token_id: int,
+        top_k: int,
+        fallback_logit: float,
+    ) -> torch.Tensor:
+        logits = self._advance_and_get_logits(state=state, token_id=token_id)
+        top_logprobs, top_indices = self._top_logprobs(logits=logits, top_k=top_k)
+
+        dense = torch.full(
+            (self.vocab_size,),
+            float(fallback_logit),
+            dtype=torch.float32,
+        )
+        dense[top_indices.to(device="cpu", dtype=torch.long)] = top_logprobs.to(
+            device="cpu",
+            dtype=torch.float32,
+        )
+        return dense
 
     def _run_text_forward(self, input_ids: torch.Tensor, past_key_values: Any | None) -> Any:
         attempts = [self._text_model]
@@ -244,22 +271,12 @@ class RuntimeLocalPrior:
         self._next_token_id = self.bos_token_id
 
     def next_logits(self) -> torch.Tensor:
-        entries = self._runtime.step(
+        return self._runtime.step_dense_logits(
             state=self._state,
             token_id=int(self._next_token_id),
             top_k=self._top_k,
+            fallback_logit=self._fallback_logit,
         )
-        logits = torch.full(
-            (self.vocab_size,),
-            self._fallback_logit,
-            dtype=torch.float32,
-        )
-        for entry in entries:
-            token_id = int(entry.get("token_id", -1))
-            logprob = float(entry.get("logprob", self._fallback_logit))
-            if 0 <= token_id < self.vocab_size:
-                logits[token_id] = logprob
-        return logits
 
     def accept_token(self, token_id: int) -> None:
         self._next_token_id = int(token_id)
