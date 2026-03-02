@@ -1,186 +1,60 @@
 # MiniCrunch
 
-MiniCrunch is a hackathon-friendly demo of lossless text compression using a remote LLM prior.
+Lossless UTF-8 text compression powered by a *remote* language-model prior.
 
-The sender and receiver both query the same model for next-token probabilities. Those probabilities drive arithmetic coding, so predictable text costs fewer bits while remaining exactly recoverable.
+MiniCrunch treats "what would the model expect next?" as a probability distribution and feeds that into arithmetic coding. When the text is predictable, it costs fewer bits. When it's surprising, you pay for the surprise. Either way, decode is exact as long as both sides use the same settings.
 
-Default model used in examples: `mistralai/Ministral-3-3B-Instruct-2512`
+## Why this is interesting
 
-## Why this version exists
+Most compressors look only at the bytes you've already seen. MiniCrunch also leverages a shared world model.
 
-This repository now uses a Transformers-only serving path with a persistent WebSocket session protocol.
+- Better compression on natural language and structured text that a model can strongly predict
+- Works over a thin client: your laptop can compress/decompress while a GPU box does the scoring
+- Archives include guardrails (backend/model/settings + SHA-256) so mismatches fail fast instead of silently corrupting output
 
-- No vLLM dependency in the runtime path
-- Persistent session with KV cache (`past_key_values`) for fast incremental scoring
-- Top-k next-token logprobs returned for each token step
-- Same codec behavior and exact roundtrip guarantees as long as compression and decompression use matching settings
+## What's implemented here
 
-## Features
+This repo is intentionally small and demo-ready:
 
-- Lossless UTF-8 text compression and decompression
-- Remote model scoring over WebSocket (optimized for Colab + ngrok)
-- CLI for compress, decompress, and benchmark
-- Web UI for upload, compress, share-link generation, and download-time decompression
-- Deterministic archive header metadata checks (backend + model guardrails)
+- A fast arithmetic codec for token IDs with a deterministic archive format (`.mcz`)
+- A Transformers-based scoring server exposing WebSocket `/ws` (persistent sessions + KV cache) and HTTP `/api/compress` + `/api/decompress`
+- A lightweight Web UI that does: upload `.txt` -> compress -> share link -> decompress/download
 
-## Repository layout
+## Layout
 
 - `src/minicrunch/arithmetic.py`: arithmetic encoder/decoder
 - `src/minicrunch/distributions.py`: logits -> integer cumulative distribution
 - `src/minicrunch/codec.py`: archive pack/unpack + compress/decompress flow
-- `src/minicrunch/backends.py`: Transformers WebSocket prior client
-- `src/minicrunch/cli.py`: CLI entrypoint and command wiring
-- `scripts/transformers_ws_server.py`: remote Transformers WebSocket scoring server
-- `scripts/web_server.py`: MiniCrunch Web UI
+- `src/minicrunch/backends.py`: WebSocket prior client
+- `src/minicrunch/cli.py`: `minicrunch` CLI
+- `scripts/transformers_ws_server.py`: remote scoring server (GPU-friendly)
+- `scripts/web_server.py`: Web UI (runs locally, points at remote scorer)
 
-## How compression works
+## Quick start (GPU server in Colab, client locally)
 
-### High-level flow
+You'll run the model server on a GPU instance and point your local CLI/Web UI at its public URL.
 
-1. Input text is tokenized by the remote model tokenizer.
-2. For each token position, MiniCrunch asks the model for a next-token distribution.
-3. MiniCrunch converts that distribution into integer frequencies.
-4. Arithmetic coding encodes the observed token ID into a compact bitstream.
-5. The archive stores the bitstream plus metadata needed to verify deterministic decode assumptions.
-6. Decompression replays the same model-driven distributions and decodes the exact original token sequence.
+### 1) Start the GPU scoring server (Colab)
 
-### Distribution detail (important)
+1. In Colab: Runtime -> Change runtime type -> Hardware accelerator: GPU.
+2. Pick a GPU with enough memory for your chosen model (16-24 GB recommended).
 
-MiniCrunch uses top-k next-token logprobs plus a fixed fallback logit for tokens outside top-k.
-
-- Top-k tokens from server keep their returned logprobs.
-- All other tokens get the configured fallback logit.
-- Softmax over this full vector is then converted into integer frequencies.
-
-This keeps runtime practical over remote links while preserving deterministic behavior if both sides use the same settings.
-
-### Arithmetic coding detail
-
-At each step:
-
-- `logits_to_cumulative()` transforms logits to integer cumulative counts with total `total_freq`.
-- Every token gets at least frequency 1 (no zero-probability symbols).
-- Encoder narrows the interval using the selected token's cumulative range.
-- Decoder performs the exact inverse using the same cumulative tables.
-
-### Why roundtrip is exact
-
-Roundtrip stays exact when all of the following match between encode/decode:
-
-- same backend (`transformers-ws`)
-- same remote model/tokenizer behavior
-- same top-k/fallback/max-context settings
-- same arithmetic parameters stored in archive metadata
-
-If model/backend assumptions differ, hash verification or metadata checks fail fast.
-
-## WebSocket protocol (primary API)
-
-Endpoint: `/ws`
-
-### Lifecycle
-
-1. Client connects.
-2. Client sends `init`.
-3. Client may send `tokenize`, `step`, `detokenize`, `reset` repeatedly.
-4. Client sends `close` and disconnects.
-
-### Request ops
-
-#### `init`
-
-```json
-{"op":"init","top_k":256,"max_context_tokens":8192}
-```
-
-#### `step`
-
-`token_id` is the token that extends context before predicting the next token distribution.
-
-```json
-{"op":"step","token_id":1234,"top_k":256}
-```
-
-#### `tokenize`
-
-```json
-{"op":"tokenize","text":"hello world"}
-```
-
-#### `detokenize`
-
-```json
-{"op":"detokenize","token_ids":[101,202,303]}
-```
-
-#### `reset`
-
-```json
-{"op":"reset"}
-```
-
-#### `close`
-
-```json
-{"op":"close"}
-```
-
-### Success response shape
-
-```json
-{"ok":true,"op":"step","top_token_logprobs":[{"token_id":42,"logprob":-0.31}]}
-```
-
-### Error response shape
-
-```json
-{"ok":false,"op":"step","code":"runtime-error","error":"..."}
-```
-
-## Setup
-
-## Local machine
-
-### 1) Create environment and install
+Then run (or upload this repo into the Colab filesystem and `cd` into it):
 
 ```bash
-uv venv
-uv sync
-```
+git clone <this-repo-url>
+cd MiniCrunch
 
-### 2) Install dev tools (optional)
-
-```bash
-uv sync --extra dev
-```
-
-### 3) Install server/web extras locally (optional)
-
-Needed only if you plan to host the model server or run the Web UI from this machine.
-
-```bash
-uv sync --extra server
-```
-
-## Colab L4 remote server with ngrok (recommended for speed/cost)
-
-### 1) Start a GPU runtime
-
-Use Colab with an L4 (24 GB) GPU.
-
-### 2) Clone repo and install dependencies
-
-```bash
 pip install "torch>=2.4" "transformers>=4.50" "fastapi>=0.115" "uvicorn>=0.30" "pyngrok>=7.2"
 ```
 
-### 3) Set ngrok auth token
+If you're using ngrok (recommended for a clean public URL):
 
 ```bash
 export NGROK_AUTHTOKEN="<your-ngrok-token>"
 ```
 
-### 4) Launch server
+Launch the server:
 
 ```bash
 python scripts/transformers_ws_server.py \
@@ -194,58 +68,51 @@ python scripts/transformers_ws_server.py \
   --print-config
 ```
 
-Expected output includes:
+Notes:
+
+- If you're using the repo defaults, you can omit `--model-id` on both server and client (the default is `mistralai/Ministral-3-3B-Instruct-2512`).
+- Decompress can omit `--model-id` to use the model stored in the archive header.
+
+You'll see output like:
 
 ```text
 PUBLIC_URL=https://abc123.ngrok-free.app
 PUBLIC_WS_URL=wss://abc123.ngrok-free.app/ws
 ```
 
-You can pass either URL to MiniCrunch client `--server-url`.
+Keep this Colab cell running.
 
-- If you pass `https://...`, client auto-converts to `wss://.../ws`.
-- If you pass `wss://.../ws`, it is used as-is.
+### 2) Install locally (CLI + optional Web UI)
 
-## Fast defaults for Colab L4 (24 GB)
-
-Recommended baseline:
-
-- server `--dtype bfloat16`
-- client `--top-k 256`
-- client `--fallback-logit -50`
-- client/server `--max-context 8192`
-- keep a persistent process and session per compression/decompression job
-
-Tradeoffs:
-
-- higher `top-k` can improve compression quality but increases compute/network payload
-- lower `top-k` is faster but may hurt compression ratio
-- very small fallback logit can over-penalize non-top-k tail tokens
-
-## CLI usage
-
-## Benchmark (Wikipedia input)
+On your machine:
 
 ```bash
-uv run minicrunch benchmark \
-  --wikipedia-title "Large language model" \
-  --server-url https://<your-ngrok-url> \
-  --model-id mistralai/Ministral-3-3B-Instruct-2512 \
-  --top-k 256 \
-  --timeout-seconds 60 \
-  --fallback-logit -50 \
-  --max-context 8192 \
-  --output-archive llm.mcz \
-  --output-decoded decoded.txt
+uv venv
+uv sync
 ```
 
-## Compress local file
+If you want to run the Web UI locally:
+
+```bash
+uv sync --extra server
+```
+
+### 3) Connect your local client to the remote server
+
+MiniCrunch accepts `http(s)` or `ws(s)` URLs.
+
+- If you pass `https://abc123...`, the client will automatically use `wss://abc123.../ws`.
+- If you pass `wss://abc123.../ws`, it's used as-is.
+
+#### CLI: compress / decompress
+
+Compress:
 
 ```bash
 uv run minicrunch compress \
   --input article.txt \
   --output article.mcz \
-  --server-url https://<your-ngrok-url> \
+  --server-url https://<your-public-url> \
   --model-id mistralai/Ministral-3-3B-Instruct-2512 \
   --top-k 256 \
   --timeout-seconds 60 \
@@ -253,111 +120,89 @@ uv run minicrunch compress \
   --max-context 8192
 ```
 
-## Decompress archive
+Decompress:
 
 ```bash
 uv run minicrunch decompress \
   --input article.mcz \
   --output roundtrip.txt \
-  --server-url https://<your-ngrok-url> \
+  --server-url https://<your-public-url> \
+  --model-id mistralai/Ministral-3-3B-Instruct-2512 \
   --top-k 256 \
   --timeout-seconds 60 \
   --fallback-logit -50 \
   --max-context 8192
 ```
 
-## Web UI workflow (compression + share + decompression)
-
-This section is for your hackathon demo path.
-
-### What the Web UI does
-
-- Accepts UTF-8 `.txt` upload
-- Compresses using the same MiniCrunch codec and remote Transformers prior
-- Stores `.mcz` archive in temporary server storage
-- Generates a share link `/d/<file_id>`
-- On open, recipient can trigger decompression and download the original `.txt`
-
-### Run Web UI on your machine
-
-Use the same remote Colab model server URL:
+#### Web UI: run locally, use the remote GPU for scoring
 
 ```bash
 uv run python scripts/web_server.py \
   --host 0.0.0.0 \
   --port 8080 \
-  --server-url https://<your-ngrok-url> \
+  --server-url https://<your-public-url> \
   --model-id mistralai/Ministral-3-3B-Instruct-2512
 ```
 
-Open:
+Open `http://localhost:8080`.
 
-- `http://localhost:8080`
+## Web UI flow (the "send someone a file" path)
 
-### Demo flow for judges
+1. Upload a UTF-8 `.txt` file.
+2. Wait for compression to finish.
+3. Copy the generated link (`/d/<file_id>`).
+4. Open it elsewhere and click download.
+5. The recipient triggers decompression and gets the exact original text back.
 
-1. Upload a text file on the home page.
-2. Wait until compression finishes.
-3. Copy the generated share link (`/d/<file_id>`).
-4. Open that link in another browser/session.
-5. Click to start decompression and download recovered `.txt`.
-6. Show original vs downloaded file byte-for-byte match.
+## A simple demo script
 
-### If you need publicly accessible Web UI
+1. Upload a known text sample and show the compression reduction stats in the UI (it compares against gzip and zstd).
+2. Open the share link in a fresh browser profile and download the recovered text.
+3. Compare original vs downloaded file byte-for-byte.
 
-The built-in server is local by default. Expose port `8080` using your preferred tunnel to share the UI URL externally.
+## How the codec stays exact
 
-## Exactness checklist
+Compression and decompression are exact when these match:
 
-Before comparing ratios/timings, make sure:
+- model (`--model-id`)
+- backend (`transformers-ws`)
+- `--top-k`, `--fallback-logit`, and `--max-context`
+- arithmetic `--total-freq` (stored in the archive header)
 
-- same `--model-id`
-- same `--top-k`
-- same `--fallback-logit`
-- same `--max-context`
-- same backend (`transformers-ws`)
+Archives include a SHA-256 of the original UTF-8 bytes, so if the prior differs at decode time you get a hard failure (unless you explicitly disable verification).
 
-If these differ, exact verification can fail by design.
+## Practical defaults
 
-## Performance notes
+These are good starting points for remote GPU scoring:
 
-Current bottlenecks in this architecture:
+- server `--dtype bfloat16` (use `float16` if BF16 isn't supported)
+- client `--top-k 256`
+- client `--fallback-logit -50`
+- client/server `--max-context 8192`
 
-- one network round trip per token step (`op=step`)
-- per-step full-vocab `log_softmax` and `topk` compute on server
-- cache rebuild cost when context window rolls over
-- JSON serialization overhead for message payloads
+Tradeoffs:
 
-For hackathon demos, prioritize stability and reproducibility over aggressive micro-optimizations.
+- higher `top-k` can improve compression ratio but increases compute and payload size per token
+- lower `top-k` is faster but can degrade compression
 
 ## Troubleshooting
 
-### Timeout errors
+### WebSocket timeouts
 
-Increase client `--timeout-seconds` and verify ngrok tunnel health.
+Increase `--timeout-seconds` on the client and check the tunnel is still up.
 
-### CUDA OOM on Colab
+### CUDA OOM on the GPU instance
 
-Reduce `--max-context`, use smaller model, or keep `--dtype bfloat16`.
+Use a smaller model, reduce `--max-context`, or switch dtype (`bfloat16`/`float16`).
 
-### Model mismatch error during decompress
+### "Archive model != loaded model"
 
-Pass the same model used during compress, or omit `--model-id` on decompress to use archive header model.
+Decode must use the same model as encode. If you compressed with one model and try to decode with another, MiniCrunch will reject it by design.
 
-### Backend mismatch error
-
-Archive created with different backend metadata. Re-compress using current `transformers-ws` path.
-
-## Run tests and lint
+## Development
 
 ```bash
+uv sync --extra dev
 uv run pytest -q
 uv run ruff check .
 ```
-
-## Hackathon pitch tips
-
-- Measure compression ratio and tokens/sec live on a known text sample.
-- Show end-to-end: upload -> compress -> share link -> decompress -> exact recovery.
-- Highlight deterministic safety checks (header + SHA-256 verification).
-- Explain that this is an LLM-prior codec, not a generic entropy coder alone.
